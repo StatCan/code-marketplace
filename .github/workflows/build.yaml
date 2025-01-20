@@ -1,44 +1,101 @@
+# This workflow will build a docker container, publish it to Azure Container Registry, and deploy it to Azure Kubernetes Service using a helm chart.
+#
+# https://github.com/Azure/actions-workflow-samples/tree/master/Kubernetes
+#
+# To configure this workflow:
+#
+# 1. Set up the following secrets in your workspace:
+#     a. REGISTRY_USERNAME with ACR username
+#     b. REGISTRY_PASSWORD with ACR Password
+#
+# 2. Change the values for the REGISTRY_NAME environment variables (below).
 name: build
+on:  
+  pull_request:
+    types:
+      - 'opened'
+      - 'synchronize'
+      - 'reopened'
 
-on:
-  push:
-    tags:
-      - "*"
-  workflow_dispatch:
-
-permissions:
-  contents: write # For creating releases.
+# Environment variables available to all jobs and steps in this workflow
+env:
+  REGISTRY_NAME: k8scc01covidacr
+  TRIVY_VERSION: "v0.58.2"
+  TRIVY_DATABASES: '"ghcr.io/aquasecurity/trivy-db:2","public.ecr.aws/aquasecurity/trivy-db"'
+  TRIVY_JAVA_DATABASES: '"ghcr.io/aquasecurity/trivy-java-db:1","public.ecr.aws/aquasecurity/trivy-java-db"'
+  TRIVY_MAX_RETRIES: 5
+  TRIVY_RETRY_DELAY: 20
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "~1.22"
+    - uses: actions/checkout@master
+    
+    # Connect to Azure Container registry (ACR)
+    - uses: azure/docker-login@v1
+      with:
+        login-server: ${{ env.REGISTRY_NAME }}.azurecr.io
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      - name: Get Go cache paths
-        id: go-cache-paths
-        run: |
-          echo "::set-output name=go-build::$(go env GOCACHE)"
-          echo "::set-output name=go-mod::$(go env GOMODCACHE)"
+    # Container build
+    - run: |
+        docker build -f Dockerfile -t localhost:5000/code-marketplace:${{ github.sha }} .
+        docker push localhost:5000/code-marketplace:${{ github.sha }}
+        docker image prune
 
-      - name: Go build cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.go-cache-paths.outputs.go-build }}
-          key: ${{ runner.os }}-release-go-build-${{ hashFiles('**/go.sum') }}
+    # Scan image for vulnerabilities
+    - name: Aqua Security Trivy image scan
+      run: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin ${{ env.TRIVY_VERSION }}
+        
+        set +e # Lets trivy return an error without it being fatal
 
-      - name: Go mod cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.go-cache-paths.outputs.go-mod }}
-          key: ${{ runner.os }}-release-go-mod-${{ hashFiles('**/go.sum') }}
+        for ((i=0; i<${{ env.TRIVY_MAX_RETRIES }}; i++)); do
+          echo "Attempt $((i + 1)) of ${{ env.TRIVY_MAX_RETRIES }}..."
 
-      - run: make build
+          trivy image \
+            --db-repository ${{ env.TRIVY_DATABASES }} \
+            --java-db-repository ${{ env.TRIVY_JAVA_DATABASES }} \
+            localhost:5000/code-marketplace:${{ github.sha }}  \
+            --exit-code 10 --timeout=20m --scanners vuln --severity CRITICAL
+          EXIT_CODE=$?
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          files: ./bin/*
+          if [[ $EXIT_CODE -eq 0 ]]; then
+            echo "Trivy scan completed successfully."
+            exit 0
+          elif [[ $EXIT_CODE -eq 10 ]]; then
+            echo "Trivy scan completed successfully. Some vulnerabilities were found."
+            exit 10
+          elif [[ $i -lt $(( ${{ env.TRIVY_MAX_RETRIES }} - 1))  ]]; then
+            echo "Encountered unexpected error. Retrying in ${{ env.TRIVY_RETRY_DELAY }} seconds..."
+            sleep ${{ env.TRIVY_RETRY_DELAY }}
+          else
+            echo "Unexpected error persists after ${{ env.TRIVY_MAX_RETRIES }} attempts. Exiting."
+            exit 1
+          fi
+        done
+    
+    - name: Test if we should push to ACR
+      id: should-i-push
+      if: |
+        github.event_name == 'push' ||
+        (
+          github.event_name == 'pull_request' &&
+          contains( github.event.pull_request.labels.*.name, 'auto-deploy')
+        )
+      run: echo 'boolean=true' >> $GITHUB_OUTPUT
+
+    - name: Push image to registry
+      if: steps.should-i-push.outputs.boolean == 'true'
+      run: |
+        docker pull localhost:5000/code-marketplace:${{ github.sha }}
+        docker tag localhost:5000/code-marketplace:${{ github.sha }} ${{ env.REGISTRY_NAME }}.azurecr.io/code-marketplace:${{ github.sha }}
+        docker push ${{ env.REGISTRY_NAME }}.azurecr.io/code-marketplace:${{ github.sha }}
