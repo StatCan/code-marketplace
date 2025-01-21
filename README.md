@@ -13,6 +13,9 @@ This marketplace reads extensions from file storage and provides an API for
 editors to consume. It does not have a frontend or any mechanisms for extension
 authors to add or update extensions in the marketplace.
 
+## Statcan workflow
+Run `make build` to generate the updated binary. Commit and get the new image tag and make changes to the appropriate deployment. 
+
 ## Deployment
 
 The marketplace is a single binary. Deployment involves running the binary,
